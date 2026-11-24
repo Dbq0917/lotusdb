@@ -42,6 +42,7 @@ type (
 		wal     *wal.WAL           // write ahead log for the memtable
 		skl     *arenaskl.Skiplist // in-memory skip list
 		options memtableOptions
+		syncWAL func() error // overridden in tests to observe fsync calls
 	}
 
 	// memtableOptions represents the configuration options for a memtable.
@@ -50,7 +51,7 @@ type (
 		tableID         uint32 // unique id of the memtable, used to generate wal file name
 		memSize         uint32 // max size of the memtable
 		walBytesPerSync uint32 // flush wal file to disk throughput BytesPerSync parameter
-		walSync         bool   // WAL flush immediately after each writing
+		walSync         bool   // database-level default for syncing every WAL batch
 	}
 )
 
@@ -177,9 +178,11 @@ func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord,
 		if _, err := mt.wal.WriteAll(); err != nil {
 			return err
 		}
-		// flush wal if necessary
-		if options.Sync && !mt.options.walSync {
-			if err := mt.wal.Sync(); err != nil {
+		// WriteAll does not apply the WAL's Sync option, so a write that
+		// requires durability must fsync here. DB-level Sync and per-write
+		// Sync share this path.
+		if options.Sync || mt.options.walSync {
+			if err := mt.sync(); err != nil {
 				return err
 			}
 		}
@@ -225,10 +228,13 @@ func (mt *memtable) close() error {
 }
 
 func (mt *memtable) sync() error {
-	if mt.wal != nil {
-		return mt.wal.Sync()
+	if mt.wal == nil {
+		return nil
 	}
-	return nil
+	if mt.syncWAL != nil {
+		return mt.syncWAL()
+	}
+	return mt.wal.Sync()
 }
 
 // memtableIterator implement baseIterator.

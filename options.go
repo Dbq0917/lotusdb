@@ -28,6 +28,8 @@ type Options struct {
 	//
 	// In other words, Sync being false has the same semantics as a write
 	// system call. Sync being true means write followed by fsync.
+	// When true, every write using the WAL is fsynced before returning,
+	// including writes committed through a Batch.
 	Sync bool
 
 	// BytesPerSync specifies the number of bytes to write before calling fsync.
@@ -104,6 +106,7 @@ type WriteOptions struct {
 	// system call. Sync being true means write followed by fsync.
 
 	// Default value is false.
+	// Setting this to true makes the write durable even if Options.Sync is false.
 	Sync bool
 
 	// DisableWal if true, writes will not first go to the write ahead log, and the write may get lost after a crash.

@@ -2,6 +2,7 @@ package lotusdb
 
 import (
 	"bytes"
+	"errors"
 	"log"
 	"os"
 	"sync"
@@ -94,6 +95,92 @@ func TestDBSync(t *testing.T) {
 	})
 	err = db.Close()
 	assert.NoError(t, err)
+}
+
+func TestDBWriteDurability(t *testing.T) {
+	tests := []struct {
+		name       string
+		dbSync     bool
+		writeSync  bool
+		disableWal bool
+		wantSync   int
+	}{
+		{
+			name:     "async write does not sync",
+			wantSync: 0,
+		},
+		{
+			name:      "per-write sync",
+			writeSync: true,
+			wantSync:  1,
+		},
+		{
+			name:     "database-level sync applies to default write",
+			dbSync:   true,
+			wantSync: 1,
+		},
+		{
+			name:      "database-level and per-write sync do not double sync",
+			dbSync:    true,
+			writeSync: true,
+			wantSync:  1,
+		},
+		{
+			name:       "disabled wal cannot sync",
+			writeSync:  true,
+			disableWal: true,
+			wantSync:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			options := DefaultOptions
+			path, err := os.MkdirTemp("", "db-test-write-durability")
+			require.NoError(t, err)
+			options.DirPath = path
+			options.Sync = tt.dbSync
+
+			db, err := Open(options)
+			require.NoError(t, err)
+			defer destroyDB(db)
+
+			syncCalls := 0
+			db.activeMem.syncWAL = func() error {
+				syncCalls++
+				return nil
+			}
+
+			err = db.PutWithOptions([]byte("key"), []byte("value"), WriteOptions{
+				Sync:       tt.writeSync,
+				DisableWal: tt.disableWal,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantSync, syncCalls)
+		})
+	}
+}
+
+func TestDBWriteSyncFailurePropagates(t *testing.T) {
+	options := DefaultOptions
+	path, err := os.MkdirTemp("", "db-test-write-sync-error")
+	require.NoError(t, err)
+	options.DirPath = path
+
+	db, err := Open(options)
+	require.NoError(t, err)
+	defer destroyDB(db)
+
+	db.activeMem.syncWAL = func() error {
+		return errors.New("sync failed")
+	}
+
+	err = db.PutWithOptions([]byte("key"), []byte("value"), WriteOptions{Sync: true})
+	require.Error(t, err)
+
+	value, err := db.Get([]byte("key"))
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	assert.Nil(t, value)
 }
 
 func TestDBPut(t *testing.T) {

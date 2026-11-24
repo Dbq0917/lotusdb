@@ -268,10 +268,7 @@ func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) err
 		batch.reset()
 		db.batchPool.Put(batch)
 	}()
-	// This is a single put operation, we can set Sync to false.
-	// Because the data will be written to the WAL,
-	// and the WAL file will be synced to disk according to the DB options.
-	batch.init(false, false, false, db).withPendingWrites()
+	batch.init(false, options.Sync, options.DisableWal, db).withPendingWrites()
 	if err := batch.Put(key, value); err != nil {
 		batch.unlock()
 		return err
@@ -314,10 +311,7 @@ func (db *DB) DeleteWithOptions(key []byte, options WriteOptions) error {
 		batch.reset()
 		db.batchPool.Put(batch)
 	}()
-	// This is a single delete operation, we can set Sync to false.
-	// Because the data will be written to the WAL,
-	// and the WAL file will be synced to disk according to the DB options.
-	batch.init(false, false, false, db).withPendingWrites()
+	batch.init(false, options.Sync, options.DisableWal, db).withPendingWrites()
 	if err := batch.Delete(key); err != nil {
 		batch.unlock()
 		return err

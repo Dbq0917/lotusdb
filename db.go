@@ -273,7 +273,6 @@ func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) err
 	// and the WAL file will be synced to disk according to the DB options.
 	batch.init(false, false, false, db).withPendingWrites()
 	if err := batch.Put(key, value); err != nil {
-		batch.unlock()
 		return err
 	}
 	return batch.Commit()
@@ -319,7 +318,6 @@ func (db *DB) DeleteWithOptions(key []byte, options WriteOptions) error {
 	// and the WAL file will be synced to disk according to the DB options.
 	batch.init(false, false, false, db).withPendingWrites()
 	if err := batch.Delete(key); err != nil {
-		batch.unlock()
 		return err
 	}
 	return batch.Commit()

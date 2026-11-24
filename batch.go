@@ -1,6 +1,7 @@
 package lotusdb
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -17,8 +18,6 @@ import (
 //
 // Batch is not a transaction, it does not guarantee isolation.
 // But it can guarantee atomicity, consistency and durability(if the Sync options is true).
-//
-// You must call Commit method to commit the batch, otherwise the DB will be locked.
 type Batch struct {
 	db            *DB
 	pendingWrites map[string]*LogRecord
@@ -43,7 +42,6 @@ func (db *DB) NewBatch(options BatchOptions) *Batch {
 		}
 		batch.batchID = node
 	}
-	batch.lock()
 	return batch
 }
 
@@ -63,7 +61,6 @@ func (b *Batch) init(rdonly, sync bool, disableWal bool, db *DB) *Batch {
 	b.options.Sync = sync
 	b.options.DisableWal = disableWal
 	b.db = db
-	b.lock()
 	return b
 }
 
@@ -75,22 +72,6 @@ func (b *Batch) reset() {
 	b.db = nil
 	b.pendingWrites = nil
 	b.committed = false
-}
-
-func (b *Batch) lock() {
-	if b.options.ReadOnly {
-		b.db.mu.RLock()
-	} else {
-		b.db.mu.Lock()
-	}
-}
-
-func (b *Batch) unlock() {
-	if b.options.ReadOnly {
-		b.db.mu.RUnlock()
-	} else {
-		b.db.mu.Unlock()
-	}
 }
 
 // Put adds a key-value pair to the batch for writing.
@@ -117,6 +98,55 @@ func (b *Batch) Put(key []byte, value []byte) error {
 	return nil
 }
 
+// readFromDB looks up a key in the committed data (memtables, index and value
+// log) outside of any pending writes. It only takes a short read lock around
+// the memtable access instead of holding the DB lock for the whole batch
+// lifecycle, so a read between NewBatch and Commit cannot deadlock.
+func (b *Batch) readFromDB(key []byte) (value []byte, deleted bool, err error) {
+	b.db.mu.RLock()
+	// get from memtables
+	tables := b.db.getMemTables()
+	for _, table := range tables {
+		tableDeleted, tableValue := table.get(key)
+		if tableDeleted {
+			b.db.mu.RUnlock()
+			return nil, true, nil
+		}
+		if len(tableValue) != 0 {
+			b.db.mu.RUnlock()
+			return tableValue, false, nil
+		}
+	}
+	b.db.mu.RUnlock()
+
+	// get from index
+	var hashValue []byte
+	var matchKey func(diskhash.Slot) (bool, error)
+	if b.db.options.IndexType == Hash {
+		matchKey = MatchKeyFunc(b.db, key, nil, &hashValue)
+	}
+
+	position, err := b.db.index.Get(key, matchKey)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if b.db.options.IndexType == Hash {
+		if hashValue == nil {
+			return nil, false, ErrKeyNotFound
+		}
+		return hashValue, false, nil
+	}
+	if position == nil {
+		return nil, false, ErrKeyNotFound
+	}
+	record, err := b.db.vlog.read(position)
+	if err != nil {
+		return nil, false, err
+	}
+	return record.value, false, nil
+}
+
 // Get retrieves the value associated with a given key from the batch.
 func (b *Batch) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
@@ -140,44 +170,14 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 		b.mu.RUnlock()
 	}
 
-	// get from memtables
-	tables := b.db.getMemTables()
-	for _, table := range tables {
-		deleted, value := table.get(key)
-		if deleted {
-			return nil, ErrKeyNotFound
-		}
-		if len(value) != 0 {
-			return value, nil
-		}
-	}
-
-	// get from index
-	var value []byte
-	var matchKey func(diskhash.Slot) (bool, error)
-	if b.db.options.IndexType == Hash {
-		matchKey = MatchKeyFunc(b.db, key, nil, &value)
-	}
-
-	position, err := b.db.index.Get(key, matchKey)
+	value, deleted, err := b.readFromDB(key)
 	if err != nil {
 		return nil, err
 	}
-
-	if b.db.options.IndexType == Hash {
-		if value == nil {
-			return nil, ErrKeyNotFound
-		}
-		return value, nil
-	}
-	if position == nil {
+	if deleted {
 		return nil, ErrKeyNotFound
 	}
-	record, err := b.db.vlog.read(position)
-	if err != nil {
-		return nil, err
-	}
-	return record.value, nil
+	return value, nil
 }
 
 // Delete marks a key for deletion in the batch.
@@ -221,32 +221,14 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 		b.mu.RUnlock()
 	}
 
-	// get from memtables
-	tables := b.db.getMemTables()
-	for _, table := range tables {
-		deleted, value := table.get(key)
-		if deleted {
+	_, deleted, err := b.readFromDB(key)
+	if err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
 			return false, nil
 		}
-		if len(value) != 0 {
-			return true, nil
-		}
-	}
-
-	// check if the key exists in index
-	var value []byte
-	var matchKeyFunc func(diskhash.Slot) (bool, error)
-	if b.db.options.IndexType == Hash {
-		matchKeyFunc = MatchKeyFunc(b.db, key, nil, &value)
-	}
-	pos, err := b.db.index.Get(key, matchKeyFunc)
-	if err != nil {
 		return false, err
 	}
-	if b.db.options.IndexType == Hash {
-		return value != nil, nil
-	}
-	return pos != nil, nil
+	return !deleted, nil
 }
 
 // Commit commits the batch, if the batch is readonly or empty, it will return directly.
@@ -255,7 +237,6 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 // then write a record to indicate the end of the batch to guarantee atomicity.
 // Finally, it will write the index.
 func (b *Batch) Commit() error {
-	defer b.unlock()
 	if b.db.closed {
 		return ErrDBClosed
 	}
@@ -271,6 +252,12 @@ func (b *Batch) Commit() error {
 	if b.committed {
 		return ErrBatchCommitted
 	}
+
+	// The DB write lock is only held for the actual commit critical section,
+	// not for the whole lifecycle of the batch, so reads between NewBatch and
+	// Commit are not blocked by the batch's own write lock.
+	b.db.mu.Lock()
+	defer b.db.mu.Unlock()
 
 	// wait for memtable space
 	if err := b.db.waitMemtableSpace(); err != nil {

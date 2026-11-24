@@ -29,10 +29,10 @@ type baseIterator interface {
 
 // Iterator holds a heap and a set of iterators that implement the baseIterator interface.
 type Iterator struct {
-	h       iterHeap
-	itrs    []*singleIter       // used for rebuilding heap
-	rankMap map[int]*singleIter // map rank->singleIter
-	db      *DB
+	h    iterHeap
+	pos  map[*singleIter]int // current position of each member in h
+	itrs []*singleIter       // all snapshot iterators, used for rebuilding the heap
+	db   *DB
 }
 
 // Rewind seek the first key in the iterator.
@@ -40,9 +40,7 @@ func (mi *Iterator) Rewind() {
 	for _, v := range mi.itrs {
 		v.iter.Rewind()
 	}
-	h := iterHeap(mi.itrs)
-	heap.Init(&h)
-	mi.h = h
+	mi.rebuildHeap(mi.itrs)
 }
 
 // Seek move the iterator to the key which is
@@ -52,43 +50,74 @@ func (mi *Iterator) Seek(key []byte) {
 	for _, v := range mi.itrs {
 		v.iter.Seek(key)
 		if v.iter.Valid() {
-			// reset idx
-			v.idx = len(seekItrs)
 			seekItrs = append(seekItrs, v)
 		}
 	}
-	h := iterHeap(seekItrs)
-	heap.Init(&h)
-	mi.h = h
+	mi.rebuildHeap(seekItrs)
 }
 
-// cleanKey Remove all unused keys from all iterators.
-// If the iterators become empty after clearing, remove them from the heap.
+// rebuildHeap rebuilds the merged heap from the given valid single iterators
+// and resynchronizes the position map with the new heap.
+func (mi *Iterator) rebuildHeap(validItrs []*singleIter) {
+	h := iterHeap(validItrs)
+	heap.Init(&h)
+	mi.h = h
+	mi.pos = make(map[*singleIter]int, h.Len())
+	for i, itr := range h {
+		mi.pos[itr] = i
+	}
+}
+
+// remove drops an exhausted iterator from the heap and deletes its position.
+func (mi *Iterator) remove(itr *singleIter) {
+	idx, ok := mi.pos[itr]
+	if !ok {
+		return
+	}
+	heap.Remove(&mi.h, idx)
+	delete(mi.pos, itr)
+	mi.syncPositions()
+}
+
+// syncPositions rebuilds the position map from the current heap layout. It is
+// simpler and safer than chasing every swap inside container/heap.
+func (mi *Iterator) syncPositions() {
+	for i, member := range mi.h {
+		mi.pos[member] = i
+	}
+}
+
+// advance moves one single iterator forward and keeps its heap entry
+// consistent, removing it from the heap once it is exhausted.
+func (mi *Iterator) advance(itr *singleIter) {
+	itr.iter.Next()
+	if itr.iter.Valid() {
+		idx, ok := mi.pos[itr]
+		if !ok {
+			return
+		}
+		heap.Fix(&mi.h, idx)
+		mi.syncPositions()
+		return
+	}
+	mi.remove(itr)
+}
+
+// cleanKey removes every occurrence of oldKey from the other iterators, so a
+// key is exposed by the merged view exactly once. The iterator that currently
+// owns the top of the heap (identified by rank) always has the freshest value
+// for that key because memtable iterators have higher ranks than index ones.
 func (mi *Iterator) cleanKey(oldKey []byte, rank int) {
-	defer func() {
-		if r := recover(); r != nil {
-			mi.db.mu.Unlock()
-		}
-	}()
-	for i := 0; i < len(mi.itrs); i++ {
-		if i == rank {
+	for _, itr := range mi.itrs {
+		if itr.rank == rank || !itr.iter.Valid() ||
+			!bytes.Equal(itr.iter.Key(), oldKey) {
 			continue
 		}
-		itr := mi.rankMap[i]
-		if !itr.iter.Valid() {
-			continue
-		}
-		for itr.iter.Valid() &&
-			bytes.Equal(itr.iter.Key(), oldKey) {
-			if itr.rank > rank {
-				panic("rank error")
-			}
-			itr.iter.Next()
-		}
-		if itr.iter.Valid() {
-			heap.Fix(&mi.h, itr.idx)
-		} else {
-			heap.Remove(&mi.h, itr.idx)
+		// A higher rank can never share the heap top's key, since it would have
+		// been ordered first by iterHeap.Less. Skip every duplicate entry; the
+		// heap position map is updated inside advance/remove.
+		for itr.iter.Valid() && bytes.Equal(itr.iter.Key(), oldKey) {
+			mi.advance(itr)
 		}
 	}
 }
@@ -104,12 +133,7 @@ func (mi *Iterator) Next() {
 	mi.cleanKey(topIter.iter.Key(), topIter.rank)
 
 	// Move to the next key and update the heap
-	topIter.iter.Next()
-	if !topIter.iter.Valid() {
-		heap.Remove(&mi.h, topIter.idx)
-	} else {
-		heap.Fix(&mi.h, topIter.idx)
-	}
+	mi.advance(topIter)
 }
 
 // Key get the current key.
@@ -119,11 +143,6 @@ func (mi *Iterator) Key() []byte {
 
 // Value get the current value.
 func (mi *Iterator) Value() []byte {
-	defer func() {
-		if r := recover(); r != nil {
-			mi.db.mu.Unlock()
-		}
-	}()
 	topIter := mi.h[0]
 	switch topIter.iType {
 	case BptreeItr:
@@ -151,12 +170,7 @@ func (mi *Iterator) Valid() bool {
 	topIter := mi.h[0]
 	if topIter.iType == MemItr && topIter.iter.Value().(y.ValueStruct).Meta == LogRecordDeleted {
 		mi.cleanKey(topIter.iter.Key(), topIter.rank)
-		topIter.iter.Next()
-		if topIter.iter.Valid() {
-			heap.Fix(&mi.h, topIter.idx)
-		} else {
-			heap.Remove(&mi.h, topIter.idx)
-		}
+		mi.advance(topIter)
 		return mi.Valid()
 	}
 	return true
@@ -164,10 +178,8 @@ func (mi *Iterator) Valid() bool {
 
 // Close the iterator.
 func (mi *Iterator) Close() error {
-	defer mi.db.mu.Unlock()
 	for _, itr := range mi.itrs {
-		err := itr.iter.Close()
-		if err != nil {
+		if err := itr.iter.Close(); err != nil {
 			return err
 		}
 	}
@@ -185,14 +197,14 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		return nil, ErrDBIteratorUnsupportedTypeHASH
 	}
 	db.mu.Lock()
-	defer func() {
-		if r := recover(); r != nil {
-			db.mu.Unlock()
-		}
-	}()
+	defer db.mu.Unlock()
 
 	itrs := make([]*singleIter, 0, db.options.PartitionNum+len(db.immuMems)+1)
-	itrsM := make(map[int]*singleIter)
+	closeItrs := func() {
+		for _, itr := range itrs {
+			_ = itr.iter.Close()
+		}
+	}
 	rank := 0
 	index, ok := db.index.(*BPTree)
 	if !ok {
@@ -202,6 +214,7 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 	for i := 0; i < db.options.PartitionNum; i++ {
 		tx, err := index.trees[i].Begin(false)
 		if err != nil {
+			closeItrs()
 			return nil, err
 		}
 		itr := newBptreeIterator(
@@ -218,14 +231,16 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 			iType:   BptreeItr,
 			options: options,
 			rank:    rank,
-			idx:     rank,
 			iter:    itr,
 		})
-		itrsM[rank] = itrs[len(itrs)-1]
 		rank++
 	}
-	memtableList := make([]*memtable, len(db.immuMems)+1)
-	copy(memtableList, append(db.immuMems, db.activeMem))
+	// Snapshot the memtable set under db.mu. The skiplist behind each
+	// memtableIterator is ref-counted and stays alive for the whole iterator
+	// lifetime, even if the memtable is flushed and removed from db.immuMems.
+	memtableList := make([]*memtable, 0, len(db.immuMems)+1)
+	memtableList = append(memtableList, db.immuMems...)
+	memtableList = append(memtableList, db.activeMem)
 	for i := 0; i < len(memtableList); i++ {
 		itr := newMemtableIterator(options, memtableList[i])
 		itr.Rewind()
@@ -238,20 +253,15 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 			iType:   MemItr,
 			options: options,
 			rank:    rank,
-			idx:     rank,
 			iter:    itr,
 		})
-		itrsM[rank] = itrs[len(itrs)-1]
 		rank++
 	}
 
-	h := iterHeap(itrs)
-	heap.Init(&h)
-
-	return &Iterator{
-		h:       h,
-		itrs:    itrs,
-		rankMap: itrsM,
-		db:      db,
-	}, nil
+	mergedIter := &Iterator{
+		itrs: itrs,
+		db:   db,
+	}
+	mergedIter.rebuildHeap(itrs)
+	return mergedIter, nil
 }

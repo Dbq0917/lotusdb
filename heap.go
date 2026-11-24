@@ -16,7 +16,6 @@ type singleIter struct {
 	iType   iterType
 	options IteratorOptions
 	rank    int //  A higher rank indicates newer data.
-	idx     int //  idx in heap
 	iter    baseIterator
 }
 
@@ -56,7 +55,6 @@ func (ih *iterHeap) Less(i int, j int) bool {
 // Swap swaps the elements with indexes i and j.
 func (ih *iterHeap) Swap(i int, j int) {
 	(*ih)[i], (*ih)[j] = (*ih)[j], (*ih)[i]
-	(*ih)[i].idx, (*ih)[j].idx = i, j
 }
 
 // Push add x as element Len().

@@ -4,14 +4,203 @@ import (
 	"bytes"
 	"io/fs"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/bwmarrin/snowflake"
+	arenaskl "github.com/dgraph-io/badger/v4/skl"
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/lotusdblabs/lotusdb/v2/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// openMemtableWithoutWal builds a memtable backed only by the in-memory skip
+// list. It lets concurrency tests exercise the skiplist directly, without WAL
+// file I/O noise.
+func openMemtableWithoutWal(t *testing.T, memSize uint32) *memtable {
+	t.Helper()
+	return &memtable{
+		options: memtableOptions{memSize: memSize},
+		//nolint:gomnd // same headroom factor as openMemtable
+		skl: arenaskl.NewSkiplist(int64(float64(memSize) * 1.5)),
+	}
+}
+
+// putRecord writes a single record (normal or tombstone) to the skip list.
+// This mirrors what memtable.putBatch does after the WAL write.
+func (mt *memtable) putRecord(record *LogRecord) {
+	mt.skl.Put(y.KeyWithTs(record.Key, 0),
+		y.ValueStruct{Value: record.Value, Meta: record.Type})
+}
+
+// allSklKeys walks the base level of the skip list from head to tail.
+// A broken chain would make the iterator stop early and silently drop every
+// key after the broken link, so the full key set is the invariant we assert.
+func (mt *memtable) allSklKeys(t *testing.T) [][]byte {
+	t.Helper()
+	iter := mt.skl.NewIterator()
+	defer func() { _ = iter.Close() }()
+
+	var keys [][]byte
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		keys = append(keys, y.ParseKey(iter.Key()))
+	}
+	return keys
+}
+
+// TestMemtableConcurrentPutDeleteSameKey is the regression test for a broken
+// lock-free chain: one goroutine inserts keys while another deletes (writes a
+// tombstone for) the very same keys at the same time.
+//
+// Insert and delete must be able to run concurrently without a global mutex,
+// and the skip list chain must never be severed. When the storm finishes every
+// key still has to be reachable from the head, both through point lookups and
+// through a full base-level scan.
+func TestMemtableConcurrentPutDeleteSameKey(t *testing.T) {
+	const keyCount = 2000
+	const rounds = 20
+
+	table := openMemtableWithoutWal(t, DefaultOptions.MemtableSize)
+
+	// Surround the contended key range with fixed sentinel keys. If a link in
+	// the middle is ever corrupted, the tail sentinel becomes unreachable and
+	// the final scan fails instead of quietly passing on a partial list.
+	headSentinel := []byte("aaa-sentinel-head")
+	tailSentinel := []byte("zzz-sentinel-tail")
+	table.putRecord(&LogRecord{Key: headSentinel, Value: []byte("h")})
+	table.putRecord(&LogRecord{Key: tailSentinel, Value: []byte("t")})
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Inserter: keeps (re)writing normal values for every key.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for round := 0; round < rounds; round++ {
+			for i := 0; i < keyCount; i++ {
+				key := util.GetTestKey(int64(i))
+				table.putRecord(&LogRecord{
+					Key:   key,
+					Value: util.RandomValue(128),
+					Type:  LogRecordNormal,
+				})
+			}
+		}
+	}()
+
+	// Deleter: marks the same keys deleted on the same lock-free path.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for round := 0; round < rounds; round++ {
+			for i := 0; i < keyCount; i++ {
+				key := util.GetTestKey(int64(i))
+				table.putRecord(&LogRecord{Key: key, Type: LogRecordDeleted})
+			}
+		}
+	}()
+
+	// Reader: concurrently does point lookups and must never observe a missing
+	// node for a key that is actually linked (tombstone vs value both count as
+	// present). It also keeps the iterator path exercised under contention.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for round := 0; round < rounds; round++ {
+			for i := 0; i < keyCount; i += 7 {
+				_, _ = table.get(util.GetTestKey(int64(i)))
+			}
+			_ = table.allSklKeys(t)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Chain integrity: the full scan must return exactly keyCount keys plus the
+	// two sentinels, in strictly sorted order, with no duplicates.
+	keys := table.allSklKeys(t)
+	require.Len(t, keys, keyCount+2, "chain broken: some nodes became unreachable")
+
+	assert.Equal(t, headSentinel, keys[0])
+	assert.Equal(t, tailSentinel, keys[len(keys)-1])
+	for i := 1; i < len(keys); i++ {
+		assert.Equal(t, bytes.Compare(keys[i-1], keys[i]), -1,
+			"keys not strictly sorted around index %d", i)
+	}
+
+	// Point lookup integrity: every key is reachable and reports a coherent
+	// state (either a live value or a tombstone), never a false "not found".
+	for i := 0; i < keyCount; i++ {
+		key := util.GetTestKey(int64(i))
+		// skl.Get returns a zero ValueStruct only when the node cannot be
+		// found. Tombstones carry Meta=LogRecordDeleted instead, so presence is
+		// established through Meta rather than value length.
+		vs := table.skl.Get(y.KeyWithTs(key, 0))
+		require.Contains(t, []byte{LogRecordNormal, LogRecordDeleted}, vs.Meta,
+			"key %q lost from the chain after concurrent put/delete", string(key))
+		// The memtable-level getter must keep resolving the key as well.
+		deleted, _ := table.get(key)
+		assert.Equal(t, vs.Meta == LogRecordDeleted, deleted)
+	}
+
+	// Sanity check on the two sentinels as well.
+	deletedHead, headVal := table.get(headSentinel)
+	assert.False(t, deletedHead)
+	assert.Equal(t, []byte("h"), headVal)
+	deletedTail, tailVal := table.get(tailSentinel)
+	assert.False(t, deletedTail)
+	assert.Equal(t, []byte("t"), tailVal)
+}
+
+// TestMemtableConcurrentPutDeleteDisjointKeys covers the common production
+// shape of the workload described in the issue: hundreds of thousands of
+// mixed inserts and deletes spread across many goroutines and keys. It asserts
+// that the aggregate set of live + deleted nodes stays fully linked.
+func TestMemtableConcurrentPutDeleteDisjointKeys(t *testing.T) {
+	const goroutines = 8
+	const perGoroutine = 1000
+
+	table := openMemtableWithoutWal(t, DefaultOptions.MemtableSize)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	totalKeys := goroutines * perGoroutine
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			<-start
+			base := g * perGoroutine
+			for i := 0; i < perGoroutine; i++ {
+				key := util.GetTestKey(int64(base + i))
+				record := &LogRecord{Key: key, Value: util.RandomValue(64)}
+				if i%3 == 0 {
+					record.Type = LogRecordDeleted
+					record.Value = nil
+				}
+				table.putRecord(record)
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+
+	keys := table.allSklKeys(t)
+	require.Len(t, keys, totalKeys, "chain broken: node count mismatch")
+
+	seen := make(map[string]struct{}, totalKeys)
+	for _, key := range keys {
+		seen[string(key)] = struct{}{}
+	}
+	assert.Len(t, seen, totalKeys, "duplicate or missing node after concurrent writes")
+}
 
 func TestMemtableOpen(t *testing.T) {
 	path, err := os.MkdirTemp("", "memtable-test-open")

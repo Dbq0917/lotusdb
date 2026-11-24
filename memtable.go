@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"sort"
-	"sync"
 
 	"github.com/bwmarrin/snowflake"
 
@@ -37,8 +36,16 @@ type (
 	//
 	// A background goroutine will flush the content of memtable into index and vlog,
 	// after that the memtable can be deleted.
+	//
+	// Concurrency: the underlying arenaskl.Skiplist is a lock-free skip list.
+	// Every tower pointer is an atomic offset and inserts publish nodes with a
+	// CAS loop, so concurrent writers never overwrite each other's links. A
+	// delete is not a physical unlink: it writes a tombstone value
+	// (LogRecordDeleted) onto the same key, hence insert and delete take the same
+	// lock-free CAS path and can never break the chain. Reads are lock-free as
+	// well. There is intentionally no global mutex here; coordination at a higher
+	// level (db.mu) and the WAL's own locks already protect batch boundaries.
 	memtable struct {
-		mu      sync.RWMutex
 		wal     *wal.WAL           // write ahead log for the memtable
 		skl     *arenaskl.Skiplist // in-memory skip list
 		options memtableOptions
@@ -185,12 +192,13 @@ func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord,
 		}
 	}
 
-	mt.mu.Lock()
 	// write to in-memory skip list
+	// The skiplist serializes contending inserts internally via CAS on the
+	// tower pointers. A delete goes through Put with a tombstone value, so it
+	// races with an insert of the same key without either one corrupting links.
 	for key, record := range pendingWrites {
 		mt.skl.Put(y.KeyWithTs([]byte(key), 0), y.ValueStruct{Value: record.Value, Meta: record.Type})
 	}
-	mt.mu.Unlock()
 
 	return nil
 }
@@ -198,9 +206,6 @@ func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord,
 // get value from memtable
 // if the specified key is marked as deleted, a true bool value is returned.
 func (mt *memtable) get(key []byte) (bool, []byte) {
-	mt.mu.RLock()
-	defer mt.mu.RUnlock()
-
 	valueStruct := mt.skl.Get(y.KeyWithTs(key, 0))
 	deleted := valueStruct.Meta == LogRecordDeleted
 	return deleted, valueStruct.Value

@@ -433,6 +433,65 @@ func TestDBFlushMemTables(t *testing.T) {
 	})
 }
 
+func TestDBFlushMemtableRemoveByTable(t *testing.T) {
+	options := DefaultOptions
+	path, err := os.MkdirTemp("", "db-test-flush-remove")
+	require.NoError(t, err)
+	options.DirPath = path
+
+	db, err := Open(options)
+	require.NoError(t, err)
+	defer destroyDB(db)
+
+	opts := memtableOptions{
+		dirPath:         path,
+		tableID:         10,
+		memSize:         options.MemtableSize,
+		walBytesPerSync: options.BytesPerSync,
+		walSync:         options.Sync,
+	}
+	first, err := openMemtable(opts)
+	require.NoError(t, err)
+	opts.tableID++
+	second, err := openMemtable(opts)
+	require.NoError(t, err)
+	opts.tableID++
+	notQueued, err := openMemtable(opts)
+	require.NoError(t, err)
+
+	firstRecord := &LogRecord{Key: []byte("first"), Value: []byte("first-value"), Type: LogRecordNormal}
+	secondRecord := &LogRecord{Key: []byte("second"), Value: []byte("second-value"), Type: LogRecordNormal}
+	require.NoError(t, first.putBatch(map[string]*LogRecord{"first": firstRecord}, 1, WriteOptions{DisableWal: true}))
+	require.NoError(t, second.putBatch(map[string]*LogRecord{"second": secondRecord}, 2, WriteOptions{DisableWal: true}))
+
+	db.immuMems = []*memtable{first, second}
+
+	// Flush the second table first. The first table must remain queued.
+	db.flushMemtable(second)
+	require.Len(t, db.immuMems, 1)
+	assert.Same(t, first, db.immuMems[0])
+
+	value, err := db.Get([]byte("second"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("second-value"), value)
+
+	// The first table is still readable from the immutable queue.
+	value, err = db.Get([]byte("first"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("first-value"), value)
+
+	db.flushMemtable(first)
+	assert.Empty(t, db.immuMems)
+
+	// Flushing a table that is not queued must not index out of range.
+	db.flushMemtable(notQueued)
+	assert.Empty(t, db.immuMems)
+
+	value, err = db.Get([]byte("first"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("first-value"), value)
+}
+
 func TestDBCompact(t *testing.T) {
 	options := DefaultOptions
 	options.AutoCompactSupport = false

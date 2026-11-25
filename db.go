@@ -522,10 +522,13 @@ func (db *DB) flushMemtable(table *memtable) {
 		}
 		db.activeMem = table
 	} else {
-		if len(db.immuMems) == 1 {
-			db.immuMems = db.immuMems[:0]
-		} else {
-			db.immuMems = db.immuMems[1:]
+		// The flush order may differ from the queue order, so remove the
+		// memtable that was actually flushed rather than the first one.
+		for i, mem := range db.immuMems {
+			if mem == table {
+				db.immuMems = append(db.immuMems[:i], db.immuMems[i+1:]...)
+				break
+			}
 		}
 	}
 	db.sendThresholdState()

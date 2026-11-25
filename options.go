@@ -34,6 +34,8 @@ type Options struct {
 	BytesPerSync uint32
 
 	// PartitionNum specifies the number of partitions to use for the index and value log.
+	// The first Open records it in DBMETA. Changing this value for an existing
+	// database triggers an offline partition migration during Open.
 	PartitionNum int
 
 	// KeyHashFunction specifies the hash function for sharding.

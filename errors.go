@@ -12,4 +12,6 @@ var (
 	ErrDBDirectoryISEmpty            = errors.New("the database directory path can not be empty")
 	ErrWaitMemtableSpaceTimeOut      = errors.New("wait memtable space timeout, try again later")
 	ErrDBIteratorUnsupportedTypeHASH = errors.New("hash index does not support iterator")
+	ErrInvalidDBMetadata             = errors.New("invalid database metadata")
+	ErrPartitionNumMismatch          = errors.New("partition number does not match database metadata")
 )

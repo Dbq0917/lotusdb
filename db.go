@@ -95,6 +95,29 @@ func Open(options Options) (*DB, error) {
 		return nil, err
 	}
 
+	storedPartitionNum, err := resolvePartitionNum(options)
+	if err != nil {
+		return nil, err
+	}
+	if storedPartitionNum != options.PartitionNum {
+		liveEntries, backupDir, migrateErr := migratePartitionLayout(options, storedPartitionNum, options.PartitionNum)
+		if migrateErr != nil {
+			return nil, fmt.Errorf("%w: stored=%d configured=%d: %v",
+				ErrPartitionNumMismatch, storedPartitionNum, options.PartitionNum, migrateErr)
+		}
+		if err = writeDBMetadata(options.DirPath, options.PartitionNum); err != nil {
+			return nil, fmt.Errorf("write partition metadata after migration: %w", err)
+		}
+		if err = storeDeprecatedEntryMeta(deprecatedMetaPath, 0, liveEntries); err != nil {
+			return nil, err
+		}
+		if backupDir != "" {
+			_ = os.RemoveAll(backupDir)
+		}
+		deprecatedNumber = 0
+		totalEntryNumber = liveEntries
+	}
+
 	// open all memtables
 	memtables, err := openAllMemtables(options)
 	if err != nil {
@@ -358,6 +381,9 @@ func validateOptions(options *Options) error {
 	}
 	if options.PartitionNum <= 0 {
 		options.PartitionNum = DefaultOptions.PartitionNum
+	}
+	if options.KeyHashFunction == nil {
+		options.KeyHashFunction = DefaultOptions.KeyHashFunction
 	}
 	if options.ValueLogFileSize <= 0 {
 		options.ValueLogFileSize = DefaultOptions.ValueLogFileSize

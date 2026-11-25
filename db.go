@@ -205,7 +205,8 @@ func (db *DB) Close() error {
 	db.flushLock.Lock()
 	// persist deprecated number and total entry number
 	deprecatedMetaPath := filepath.Join(db.options.DirPath, deprecatedMetaName)
-	err := storeDeprecatedEntryMeta(deprecatedMetaPath, db.vlog.deprecatedNumber, db.vlog.totalNumber)
+	totalNumber := atomic.LoadUint32(&db.vlog.totalNumber)
+	err := storeDeprecatedEntryMeta(deprecatedMetaPath, db.vlog.deprecatedNumber, totalNumber)
 	if err != nil {
 		return err
 	}
@@ -534,8 +535,9 @@ func (db *DB) flushMemtable(table *memtable) {
 func (db *DB) sendThresholdState() {
 	if db.options.AutoCompactSupport {
 		// check deprecatedtable size
-		lowerThreshold := uint32((float32)(db.vlog.totalNumber) * db.options.AdvisedCompactionRate)
-		upperThreshold := uint32((float32)(db.vlog.totalNumber) * db.options.ForceCompactionRate)
+		totalNumber := atomic.LoadUint32(&db.vlog.totalNumber)
+		lowerThreshold := uint32((float32)(totalNumber) * db.options.AdvisedCompactionRate)
+		upperThreshold := uint32((float32)(totalNumber) * db.options.ForceCompactionRate)
 		thresholdState := deprecatedState{
 			thresholdState: ThresholdState(UnarriveThreshold),
 		}

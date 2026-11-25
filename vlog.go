@@ -3,6 +3,7 @@ package lotusdb
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"github.com/rosedblabs/wal"
@@ -93,12 +94,12 @@ func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
 func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, error) {
 	// group the records by partition
 	partitionRecords := make([][]*ValueLogRecord, vlog.options.partitionNum)
-	vlog.totalNumber += uint32(len(records))
 	for _, record := range records {
 		p := vlog.getKeyPartition(record.key)
 		partitionRecords[p] = append(partitionRecords[p], record)
 	}
 
+	writtenCounts := make([]uint32, vlog.options.partitionNum)
 	// channel for receiving the positions of the records after writing to the value log
 	posChan := make(chan []*KeyPosition, vlog.options.partitionNum)
 	g, ctx := errgroup.WithContext(context.Background())
@@ -131,6 +132,7 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 			if err != nil {
 				return err
 			}
+			writtenCounts[part] = uint32(len(positions))
 			for i, pos := range positions {
 				keyPositions = append(keyPositions, &KeyPosition{
 					key:       partitionRecords[part][writeIdx+i].key,
@@ -144,8 +146,14 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+	writeErr := g.Wait()
+	var writtenNumber uint32
+	for _, writtenCount := range writtenCounts {
+		writtenNumber += writtenCount
+	}
+	atomic.AddUint32(&vlog.totalNumber, writtenNumber)
+	if writeErr != nil {
+		return nil, writeErr
 	}
 	close(posChan)
 
@@ -197,6 +205,14 @@ func (vlog *valueLog) cleanDeprecatedTable() {
 	for i := 0; i < int(vlog.options.partitionNum); i++ {
 		vlog.dpTables[i].clean()
 	}
-	vlog.totalNumber -= vlog.deprecatedNumber
+	deprecatedNumber := vlog.deprecatedNumber
+	for {
+		currentTotal := atomic.LoadUint32(&vlog.totalNumber)
+		if atomic.CompareAndSwapUint32(
+			&vlog.totalNumber, currentTotal, currentTotal-deprecatedNumber,
+		) {
+			break
+		}
+	}
 	vlog.deprecatedNumber = 0
 }

@@ -9,6 +9,8 @@ type iterType uint8
 const (
 	BptreeItr iterType = iota
 	MemItr
+	// HashItr is the iterator over a sorted snapshot of the hash index.
+	HashItr
 )
 
 // singleIter element used to construct the heap，implementing the container.heap interface.

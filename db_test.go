@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1049,14 +1051,76 @@ func TestDBIterator(t *testing.T) {
 	err = iter.Close()
 	require.NoError(t, err)
 
-	// unsupported type
-	options = DefaultOptions
+}
+
+func TestDBHashIterator(t *testing.T) {
+	options := DefaultOptions
+	options.AutoCompactSupport = false
 	options.IndexType = Hash
-	db, err = Open(options)
+	path, err := os.MkdirTemp("", "db-test-hash-iter")
 	require.NoError(t, err)
-	itr, err := db.NewIterator(IteratorOptions{Reverse: false})
-	assert.Equal(t, ErrDBIteratorUnsupportedTypeHASH, err)
-	assert.Nil(t, itr)
+	options.DirPath = path
+	db, err := Open(options)
+	require.NoError(t, err)
+	defer destroyDB(db)
+
+	// write some keys, and delete a few of them
+	const writeCount = 10000
+	const deleteCount = 100
+	for i := 0; i < writeCount; i++ {
+		key := []byte("hash-iter-key-" + strconv.Itoa(i))
+		value := []byte("hash-iter-value-" + strconv.Itoa(i))
+		require.NoError(t, db.Put(key, value))
+	}
+	for i := 0; i < deleteCount; i++ {
+		key := []byte("hash-iter-key-" + strconv.Itoa(i))
+		require.NoError(t, db.Delete(key))
+	}
+
+	// iterate all the keys in the memtable, the number of keys
+	// must be equal to the number of written keys
+	countKeys := func() int {
+		iter, err := db.NewIterator(IteratorOptions{Reverse: false})
+		require.NoError(t, err)
+		count := 0
+		for iter.Rewind(); iter.Valid(); iter.Next() {
+			key := iter.Key()
+			value := iter.Value()
+			assert.True(t, bytes.HasPrefix(key, []byte("hash-iter-key-")))
+			assert.Equal(t, "hash-iter-value-"+strings.TrimPrefix(string(key), "hash-iter-key-"), string(value))
+			count++
+		}
+		require.NoError(t, iter.Close())
+		return count
+	}
+	assert.Equal(t, writeCount-deleteCount, countKeys())
+
+	// flush the memtables, so all the keys are stored in the hash index,
+	// iterate again, the number of keys must still be equal
+	db.flushMemtable(db.activeMem)
+	assert.Equal(t, writeCount-deleteCount, countKeys())
+
+	// iterate in reverse order
+	iter, err := db.NewIterator(IteratorOptions{Reverse: true})
+	require.NoError(t, err)
+	count := 0
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		count++
+	}
+	require.NoError(t, iter.Close())
+	assert.Equal(t, writeCount-deleteCount, count)
+
+	// iterate with prefix
+	iter, err = db.NewIterator(IteratorOptions{Reverse: false, Prefix: []byte("hash-iter-key-99")})
+	require.NoError(t, err)
+	count = 0
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		assert.True(t, bytes.HasPrefix(iter.Key(), []byte("hash-iter-key-99")))
+		count++
+	}
+	require.NoError(t, iter.Close())
+	// hash-iter-key-99, 990..999, 9900..9999, but 990 is deleted... just check non-zero and all prefixed
+	assert.Greater(t, count, 0)
 }
 
 func TestDeprecatetableMetaPersist(t *testing.T) {

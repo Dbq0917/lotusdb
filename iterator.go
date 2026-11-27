@@ -126,7 +126,7 @@ func (mi *Iterator) Value() []byte {
 	}()
 	topIter := mi.h[0]
 	switch topIter.iType {
-	case BptreeItr:
+	case BptreeItr, HashItr:
 		keyPos := new(KeyPosition)
 		keyPos.key = topIter.iter.Key()
 		keyPos.partition = uint32(mi.db.vlog.getKeyPartition(topIter.iter.Key()))
@@ -181,8 +181,14 @@ func (mi *Iterator) Close() error {
 // The iterator is not goroutine-safe, you should not use the same iterator
 // concurrently from multiple goroutines.
 func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
+	// For the hash index, the iterator snapshots all the key positions
+	// from the index files when it is created. Hold flushLock to prevent
+	// flush and compaction from rewriting the index and value log files
+	// while snapshotting. flushLock must be acquired before db.mu to
+	// match the lock order of flushMemtable.
 	if db.options.IndexType == Hash {
-		return nil, ErrDBIteratorUnsupportedTypeHASH
+		db.flushLock.Lock()
+		defer db.flushLock.Unlock()
 	}
 	db.mu.Lock()
 	defer func() {
@@ -194,35 +200,59 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 	itrs := make([]*singleIter, 0, db.options.PartitionNum+len(db.immuMems)+1)
 	itrsM := make(map[int]*singleIter)
 	rank := 0
-	index, ok := db.index.(*BPTree)
-	if !ok {
-		panic("index type not support")
-	}
 
-	for i := 0; i < db.options.PartitionNum; i++ {
-		tx, err := index.trees[i].Begin(false)
-		if err != nil {
-			return nil, err
+	switch index := db.index.(type) {
+	case *BPTree:
+		for i := 0; i < db.options.PartitionNum; i++ {
+			tx, err := index.trees[i].Begin(false)
+			if err != nil {
+				return nil, err
+			}
+			itr := newBptreeIterator(
+				tx,
+				options,
+			)
+			itr.Rewind()
+			// is empty
+			if !itr.Valid() {
+				_ = itr.Close()
+				continue
+			}
+			itrs = append(itrs, &singleIter{
+				iType:   BptreeItr,
+				options: options,
+				rank:    rank,
+				idx:     rank,
+				iter:    itr,
+			})
+			itrsM[rank] = itrs[len(itrs)-1]
+			rank++
 		}
-		itr := newBptreeIterator(
-			tx,
-			options,
-		)
-		itr.Rewind()
-		// is empty
-		if !itr.Valid() {
-			_ = itr.Close()
-			continue
+	case *HashTable:
+		for i := 0; i < db.options.PartitionNum; i++ {
+			itr, err := newHashIndexIterator(db, i, options)
+			if err != nil {
+				db.mu.Unlock()
+				return nil, err
+			}
+			itr.Rewind()
+			// is empty
+			if !itr.Valid() {
+				_ = itr.Close()
+				continue
+			}
+			itrs = append(itrs, &singleIter{
+				iType:   HashItr,
+				options: options,
+				rank:    rank,
+				idx:     rank,
+				iter:    itr,
+			})
+			itrsM[rank] = itrs[len(itrs)-1]
+			rank++
 		}
-		itrs = append(itrs, &singleIter{
-			iType:   BptreeItr,
-			options: options,
-			rank:    rank,
-			idx:     rank,
-			iter:    itr,
-		})
-		itrsM[rank] = itrs[len(itrs)-1]
-		rank++
+	default:
+		panic("index type not support")
 	}
 	memtableList := make([]*memtable, len(db.immuMems)+1)
 	copy(memtableList, append(db.immuMems, db.activeMem))
